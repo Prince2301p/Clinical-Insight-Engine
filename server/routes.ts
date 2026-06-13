@@ -17,7 +17,7 @@ import {
 } from "./middleware/rateLimit";
 import { rateLimit } from "express-rate-limit";
 import { MLService, calculateClinicalFallback, generateRequestFingerprint } from "./services/mlService";
-import { getAssessmentQueue, getPythonExecutable } from "./queue";
+import { getAssessmentQueue } from "./queue";
 import { execFile } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -28,7 +28,13 @@ import os from "os";
 import { randomUUID } from "crypto";
 import { writeFile, unlink } from "fs/promises";
 import { z } from "zod";
-import { assessmentExportQuerySchema, searchQuerySchema } from "./validation/searchValidation";
+import { searchQuerySchema } from "./validation/searchValidation";
+
+const assessmentExportQuerySchema = z.object({
+  limit: z.number().int().min(1).max(100).optional().default(50),
+  cursor: z.number().int().optional(),
+  riskCategory: z.enum(["LOW", "MODERATE", "HIGH"]).optional(),
+});
 import { assessmentsToCsv } from "./utils/csvExport";
 import { analyzeSearchInput, logSecurityEvent, sanitizeDatabaseError } from "./security/sqlProtection";
 import { canAccessPatientRecord } from "./services/authz/patient-access";
@@ -37,6 +43,10 @@ import { logAccessAttempt } from "./security/access-audit";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const analyzePyPath = path.resolve(__dirname, "..", "analyze.py");
+
+function getPythonExecutable() {
+  return process.platform === "win32" ? "python" : "python3";
+}
 
 function execFileAsync(file: string, args: string[], options: any): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {

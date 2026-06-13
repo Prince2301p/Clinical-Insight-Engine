@@ -3,7 +3,7 @@ import { storage } from "./storage";
 import IORedis from "ioredis";
 import { sendCriticalRiskAlert } from "./email";
 import { logger } from "./logger";
-import { MLService } from "./services/mlService";
+import { MLService, calculateClinicalFallback, generateRequestFingerprint } from "./services/mlService";
 
 let redisConnectionInstance: IORedis | null = null;
 let assessmentQueueInstance: Queue | null = null;
@@ -78,48 +78,18 @@ export function startAssessmentWorker(): void {
     "assessmentQueue",
     async (job: Job) => {
       const { input, userId, userEmail } = job.data;
+      const requestId = job.data.requestId || generateRequestFingerprint(input, userId);
+      const startedAt = Date.now();
 
       try {
-        const { prediction } = await MLService.runAssessmentInference(input);
         let prediction: any;
         
-        if (!isPythonAvailable) {
-           prediction = calculateClinicalFallback(input);
-        } else {
-          await writeFile(tempFile, JSON.stringify(input));
-          const stdout = await new Promise<string>((resolve, reject) => {
-            const child = execFile(
-              getPythonExecutable(),
-            [analyzePyPath, "predict_file", tempFile],
-            {
-              timeout: 60000,
-              killSignal: "SIGTERM",
-            },
-            (error, stdout, stderr) => {
-              if (error) {
-                reject(error);
-              } else {
-                resolve(stdout);
-              }
-            }
-          );
-
-          const fallbackTimer = setTimeout(() => {
-            try {
-              child.kill("SIGKILL");
-            } catch (e) {
-              // ignore
-            }
-            reject(new Error("Clinical assessment timed out (forced kill)."));
-          }, 65000);
-
-          child.on("close", () => clearTimeout(fallbackTimer));
-        });
-
-          prediction = JSON.parse(stdout.trim());
-          if (prediction.error) {
-            throw new Error(prediction.error);
-          }
+        try {
+          const result = await MLService.runAssessmentInference(input);
+          prediction = result.prediction;
+        } catch (error: any) {
+          logger.warn({ error: error.message }, "ML inference failed, using fallback");
+          prediction = calculateClinicalFallback(input);
         }
 
         logger.info(

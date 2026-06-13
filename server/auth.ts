@@ -10,7 +10,7 @@ import { users, emailVerificationTokens, passwordResetTokens } from "@shared/sch
 import { sendVerificationEmail, sendPasswordResetEmail } from "./email";
 import { logger } from "./logger";
 import { validateDTO } from "./middleware/validateDTO";
-import { registerDTOSchema, loginDTOSchema, forgotPasswordDTOSchema, resetPasswordDTOSchema, verifyEmailDTOSchema } from "./validation/auth.dto";
+import { registerDTOSchema, loginDTOSchema, forgotPasswordDTOSchema, resetPasswordDTOSchema, verifyEmailDTOSchema, verifyOtpDTOSchema } from "./validation/auth.dto";
 
 function hashPassword(password: string): string {
   return bcrypt.hashSync(password, 10);
@@ -43,12 +43,6 @@ interface RegisteredUser {
   licenseNumber: string;
 }
 
-export function getOtpRateLimitKey({ body, ip }: { body: { email?: string }; ip: string }): string {
-  if (body.email) {
-    return `otp:${body.email.toLowerCase().trim()}`;
-  }
-  return `otp:${ip}`;
-}
 
 /**
  * Strict rate limiter for sensitive endpoints (e.g., registration).
@@ -110,12 +104,15 @@ function generateOtp(): string {
   return randomInt(100000, 999999).toString();
 }
 
-export const pendingOtps = new Map<string, { otp: string; expiresAt: number }>();
+const otpLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  limit: 5,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: { error: "Too many OTP verification attempts. Please try again later." },
+});
 
-export function getOtpRateLimitKey(req: { body: { email?: string }; ip: string }): string {
-  const email = req.body?.email?.trim().toLowerCase();
-  return email ? `otp:${email}` : `otp:${req.ip}`;
-}
+export const pendingOtps = new Map<string, { otp: string; expiresAt: number; attempts?: number }>();
 
 function logDevOtp(email: string, otp: string) {
   if (process.env.NODE_ENV !== "production") {
@@ -348,37 +345,17 @@ export function createAuthRouter(): Router {
       const [dbUser] = await db
         .select()
         .from(users)
-        .where(eq(users.email, email))
+        .where(and(eq(users.email, email), eq(users.isActive, true)))
         .limit(1);
 
-      // Also check DB
-      if (!userName) {
-        try {
-          const db = getDb();
-          const [dbUser] = await db
-            .select()
-            .from(users)
-            .where(and(eq(users.email, email), eq(users.isActive, true)))
-            .limit(1);
-
-          if (dbUser && verifyPassword(password, dbUser.passwordHash)) {
-            userName = dbUser.fullName;
-          }
-        } catch (_err) {
-          // DB not available — fall back to in-memory only
-          logger.warn("DB unavailable for login, using in-memory only.");
-          const registeredUser = registeredUsers.get(email);
-          if (registeredUser && verifyPassword(password, registeredUser.passwordHash)) {
-            userName = registeredUser.fullName;
-          }
-        }
+      if (!dbUser || !verifyPassword(password, dbUser.passwordHash)) {
+        return res.status(401).json({ message: "Invalid email or password." });
       }
 
       const otp = generateOtp();
       const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
       await db.transaction(async (tx) => {
-        // Invalidate old unused tokens
         await tx
           .update(emailVerificationTokens)
           .set({ used: true })
@@ -403,7 +380,6 @@ export function createAuthRouter(): Router {
 
       logDevOtp(email, otp);
 
-      // Create a pending session
       await regenerateSession(req);
       req.session.pendingUser = { id: dbUser.id, email: dbUser.email };
       await saveSession(req);
@@ -430,6 +406,7 @@ export function createAuthRouter(): Router {
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
     try {
+      const mode = req.body.mode;
       if (mode === "login") {
         const pending = pendingOtps.get(email);
 
@@ -443,7 +420,7 @@ export function createAuthRouter(): Router {
         }
 
         pendingOtps.set(email, { otp, expiresAt: expiresAt.getTime(), attempts: 0 });
-        const emailSent = await sendVerificationCode(email, otp);
+        const emailSent = await sendVerificationEmail(email, otp);
         if (!emailSent) {
           return res.status(503).json({ message: "Failed to send verification email. Please try again." });
         }
@@ -930,11 +907,4 @@ export function requireAdmin(req: Request, res: Response, next: NextFunction) {
   return res.status(403).json({ message: "Admin access required." });
 }
 
-export function getOtpRateLimitKey(req: any): string {
-  const email = req.body?.email;
-  if (email && typeof email === "string" && email.trim()) {
-    return `otp:${email.trim().toLowerCase()}`;
-  }
-  return `otp:ip:${req.ip || "unknown"}`;
-}
 

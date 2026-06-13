@@ -8,6 +8,7 @@
 
 import { logger } from "../logger";
 import { storage } from "../storage";
+import { Request } from "express";
 
 export interface AuditEvent {
   timestamp: string;
@@ -66,7 +67,7 @@ export function logAccessAttempt(
     resourceId: String(resourceId),
     action: granted ? "VIEW" : "DENIED",
     ipAddress: req?.ip,
-    userAgent: req?.headers?.["user-agent"],
+    userAgent: req?.header("user-agent"),
     granted,
   }).catch((err) => logger.error({ err }, "Failed to persist access audit log"));
 }
